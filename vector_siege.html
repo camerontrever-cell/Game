@@ -1,0 +1,1078 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VECTOR SIEGE</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;800&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/phaser@3.70.0/dist/phaser.min.js"></script>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #05060f;
+    overflow: hidden;
+    height: 100%;
+    width: 100%;
+  }
+  #game-root {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100vw;
+    height: 100vh;
+    background: #05060f;
+  }
+  canvas {
+    image-rendering: pixelated;
+  }
+</style>
+</head>
+<body>
+<div id="game-root"></div>
+<script>
+/* =========================================================================
+   VECTOR SIEGE
+   A neon-geometric, top-down arena survival shooter built with Phaser 3.
+
+   ARCHITECTURE OVERVIEW
+   ----------------------------------------------------------------------
+   - All visual assets (ship, bullets, enemies, boss, shards, particles,
+     UI hearts, background grid) are generated procedurally at runtime
+     using Phaser.GameObjects.Graphics -> generateTexture(). No external
+     image files are used anywhere.
+   - All audio (shots, hits, explosions, pickups, overheat, wave-clear,
+     victory/defeat stingers, background arpeggio) is synthesized live
+     with the Web Audio API through a small SFX module (see `Audio`
+     below). No external audio files are used anywhere.
+   - Game STATE (score, health, wave, overdrive charge, weapon heat) is
+     stored in a single plain object, `GameData`, that is completely
+     decoupled from rendering. Scenes and entity classes read/write
+     GameData and then call render/update functions; nothing derives
+     game logic from what is currently drawn on screen.
+   - Scenes: PreloadScene -> MenuScene -> GameScene -> GameOverScene /
+     VictoryScene. Pausing is a sub-state inside GameScene (state
+     machine: 'menu' -> 'playing' <-> 'paused' -> 'gameover' | 'victory').
+   - Entity logic is split into small factory functions / classes:
+     Player, EnemyFactory, BulletFactory, ShardFactory, WaveManager,
+     Boss. Collision handling lives in GameScene.setupCollisions().
+   ========================================================================= */
+
+// ---------------------------------------------------------------------------
+// COLOR PALETTE & THEME CONSTANTS
+// A single neon-on-void palette used consistently across every scene.
+// ---------------------------------------------------------------------------
+const PALETTE = {
+  bg:        0x05060f,
+  grid:      0x121a3a,
+  player:    0x00e5ff, // cyan
+  playerDim: 0x0a4d5c,
+  grunt:     0xff2e93, // magenta
+  shooter:   0xffb400, // amber
+  chaser:    0x9d4edd, // violet
+  boss:      0xff3860, // red
+  shard:     0x39ff88, // green
+  bulletP:   0xeaf6ff, // near-white
+  bulletE:   0xffb400,
+  ui:        0xeaf6ff,
+  danger:    0xff3860
+};
+const HEX = (c) => '#' + c.toString(16).padStart(6, '0');
+
+// ---------------------------------------------------------------------------
+// GAME DATA — the single source of truth for game state. Rendering code
+// reads from this object; it never stores authoritative state itself.
+// ---------------------------------------------------------------------------
+const GameData = {
+  score: 0,
+  wave: 1,
+  totalWaves: 4, // waves 1-3 are standard, wave 4 is the boss
+  health: 5,
+  maxHealth: 5,
+  overdrive: 0,        // 0-100 charge meter
+  overdriveActive: false,
+  overdriveTimer: 0,
+  heat: 0,              // 0-100 weapon heat
+  overheated: false,
+  state: 'menu',         // menu | playing | paused | gameover | victory
+  muted: false,
+  enemiesKilled: 0,
+  shardsCollected: 0,
+
+  reset() {
+    this.score = 0;
+    this.wave = 1;
+    this.health = this.maxHealth;
+    this.overdrive = 0;
+    this.overdriveActive = false;
+    this.overdriveTimer = 0;
+    this.heat = 0;
+    this.overheated = false;
+    this.state = 'playing';
+    this.enemiesKilled = 0;
+    this.shardsCollected = 0;
+  }
+};
+
+// ---------------------------------------------------------------------------
+// AUDIO MODULE — tiny procedural synth built directly on the Web Audio API.
+// Kept separate from Phaser's sound manager so it works identically across
+// scenes without needing to decode/register audio assets.
+// ---------------------------------------------------------------------------
+const Audio = {
+  ctx: null,
+  musicTimer: null,
+  musicStep: 0,
+
+  init() {
+    if (!this.ctx) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      this.ctx = new Ctx();
+    }
+  },
+
+  resume() {
+    this.init();
+    if (this.ctx.state === 'suspended') this.ctx.resume();
+  },
+
+  // Plays a single synthesized tone. type: 'sine'|'square'|'sawtooth'|'triangle'
+  tone(freq, dur, type = 'sine', gainVal = 0.15, glideTo = null) {
+    if (GameData.muted || !this.ctx) return;
+    const t0 = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t0);
+    if (glideTo) osc.frequency.exponentialRampToValueAtTime(glideTo, t0 + dur);
+    gain.gain.setValueAtTime(gainVal, t0);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(gain).connect(this.ctx.destination);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.02);
+  },
+
+  // Short burst of filtered noise, used for explosions / impacts.
+  noiseBurst(dur = 0.25, gainVal = 0.2, filterFreq = 1200) {
+    if (GameData.muted || !this.ctx) return;
+    const bufferSize = this.ctx.sampleRate * dur;
+    const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+      data[i] = (Math.random() * 2 - 1) * (1 - i / bufferSize);
+    }
+    const src = this.ctx.createBufferSource();
+    src.buffer = buffer;
+    const filter = this.ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = filterFreq;
+    const gain = this.ctx.createGain();
+    gain.gain.setValueAtTime(gainVal, this.ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.0001, this.ctx.currentTime + dur);
+    src.connect(filter).connect(gain).connect(this.ctx.destination);
+    src.start();
+  },
+
+  shoot()      { this.tone(720, 0.08, 'square', 0.06, 420); },
+  enemyShoot() { this.tone(260, 0.12, 'sawtooth', 0.05, 160); },
+  hit()        { this.tone(180, 0.1, 'square', 0.08, 90); },
+  playerHit()  { this.noiseBurst(0.3, 0.25, 500); this.tone(120, 0.25, 'sawtooth', 0.1, 60); },
+  explosion()  { this.noiseBurst(0.35, 0.3, 900); },
+  pickup()     { this.tone(880, 0.08, 'triangle', 0.08, 1320); },
+  overheat()   { this.tone(90, 0.4, 'sawtooth', 0.15, 50); },
+  overdrive()  { this.tone(440, 0.15, 'triangle', 0.12, 1100); this.tone(660, 0.2, 'triangle', 0.1, 1320); },
+  waveClear()  { [523, 659, 784].forEach((f, i) => setTimeout(() => this.tone(f, 0.22, 'triangle', 0.12), i * 90)); },
+  victory()    { [523, 659, 784, 1046].forEach((f, i) => setTimeout(() => this.tone(f, 0.35, 'triangle', 0.14), i * 130)); },
+  defeat()     { [220, 196, 174, 130].forEach((f, i) => setTimeout(() => this.tone(f, 0.4, 'sawtooth', 0.12), i * 150)); },
+  uiClick()    { this.tone(500, 0.06, 'square', 0.06, 700); },
+
+  // Minimal looping arpeggio "background music" driven by a repeating
+  // Phaser-independent setInterval so it survives scene transitions cleanly.
+  startMusic() {
+    this.stopMusic();
+    const pattern = [130.8, 155.6, 196.0, 246.9, 196.0, 155.6];
+    this.musicStep = 0;
+    this.musicTimer = setInterval(() => {
+      if (!GameData.muted && GameData.state === 'playing') {
+        const f = pattern[this.musicStep % pattern.length];
+        this.tone(f, 0.5, 'sine', 0.035);
+        this.tone(f * 2, 0.3, 'triangle', 0.02);
+      }
+      this.musicStep++;
+    }, 420);
+  },
+  stopMusic() {
+    if (this.musicTimer) clearInterval(this.musicTimer);
+    this.musicTimer = null;
+  }
+};
+
+// ---------------------------------------------------------------------------
+// TEXTURE FACTORY — draws every sprite the game needs onto Graphics objects
+// and bakes them into reusable textures. Called once from PreloadScene.
+// ---------------------------------------------------------------------------
+function generateTextures(scene) {
+  const g = scene.add.graphics();
+
+  // --- Player ship: a forward-pointing triangle with an inner glow core.
+  g.clear();
+  g.fillStyle(PALETTE.playerDim, 1);
+  g.fillTriangle(16, 0, 30, 30, 2, 30);
+  g.lineStyle(2, PALETTE.player, 1);
+  g.strokeTriangle(16, 0, 30, 30, 2, 30);
+  g.fillStyle(PALETTE.player, 1);
+  g.fillTriangle(16, 8, 22, 26, 10, 26);
+  g.generateTexture('player', 32, 32);
+
+  // --- Player bullet: small elongated capsule.
+  g.clear();
+  g.fillStyle(PALETTE.bulletP, 1);
+  g.fillRoundedRect(0, 0, 6, 16, 3);
+  g.generateTexture('bulletPlayer', 6, 16);
+
+  // --- Enemy bullet: small diamond.
+  g.clear();
+  g.fillStyle(PALETTE.bulletE, 1);
+  g.fillTriangle(5, 0, 10, 6, 5, 12);
+  g.fillTriangle(5, 0, 0, 6, 5, 12);
+  g.generateTexture('bulletEnemy', 10, 12);
+
+  // --- Grunt: filled square with beveled corners, magenta stroke.
+  g.clear();
+  g.fillStyle(0x1a0a14, 1);
+  g.fillRoundedRect(0, 0, 26, 26, 4);
+  g.lineStyle(3, PALETTE.grunt, 1);
+  g.strokeRoundedRect(0, 0, 26, 26, 4);
+  g.fillStyle(PALETTE.grunt, 1);
+  g.fillRoundedRect(8, 8, 10, 10, 2);
+  g.generateTexture('grunt', 26, 26);
+
+  // --- Shooter: hexagon, amber.
+  g.clear();
+  drawPolygon(g, 15, 15, 15, 6, 0x1a1206, PALETTE.shooter, 3);
+  g.generateTexture('shooter', 30, 30);
+
+  // --- Chaser: sharp triangle, violet, smaller & fast-looking.
+  g.clear();
+  g.fillStyle(0x140a1e, 1);
+  g.fillTriangle(11, 0, 22, 22, 0, 22);
+  g.lineStyle(3, PALETTE.chaser, 1);
+  g.strokeTriangle(11, 0, 22, 22, 0, 22);
+  g.generateTexture('chaser', 22, 22);
+
+  // --- Boss: large hexagon with double ring.
+  g.clear();
+  drawPolygon(g, 45, 45, 45, 6, 0x1a0a10, PALETTE.boss, 4);
+  drawPolygon(g, 45, 45, 30, 6, 0x1a0a10, PALETTE.boss, 2);
+  g.generateTexture('boss', 90, 90);
+
+  // --- Shard (pickup): small rotating diamond, green.
+  g.clear();
+  g.fillStyle(PALETTE.shard, 1);
+  g.fillTriangle(7, 0, 14, 7, 7, 14);
+  g.fillTriangle(7, 0, 0, 7, 7, 14);
+  g.generateTexture('shard', 14, 14);
+
+  // --- Particle: tiny circle used for explosions / trails.
+  g.clear();
+  g.fillStyle(0xffffff, 1);
+  g.fillCircle(4, 4, 4);
+  g.generateTexture('particle', 8, 8);
+
+  // --- Heart icon for HUD health.
+  g.clear();
+  g.fillStyle(PALETTE.danger, 1);
+  g.fillCircle(6, 6, 6);
+  g.fillCircle(16, 6, 6);
+  g.fillTriangle(0, 8, 22, 8, 11, 22);
+  g.generateTexture('heart', 22, 22);
+
+  // --- Background grid tile (drawn once, tiled via TileSprite).
+  g.clear();
+  g.fillStyle(PALETTE.bg, 1);
+  g.fillRect(0, 0, 64, 64);
+  g.lineStyle(1, PALETTE.grid, 0.6);
+  g.strokeRect(0, 0, 64, 64);
+  g.generateTexture('gridTile', 64, 64);
+
+  g.destroy();
+}
+
+// Helper: draws a regular polygon with `sides` sides onto a Graphics obj.
+function drawPolygon(g, cx, cy, radius, sides, fillColor, strokeColor, strokeWidth) {
+  const points = [];
+  for (let i = 0; i < sides; i++) {
+    const angle = (Math.PI * 2 * i) / sides - Math.PI / 2;
+    points.push(new Phaser.Geom.Point(cx + radius * Math.cos(angle), cy + radius * Math.sin(angle)));
+  }
+  g.fillStyle(fillColor, 1);
+  g.fillPoints(points, true);
+  g.lineStyle(strokeWidth, strokeColor, 1);
+  g.strokePoints(points, true);
+}
+
+// ---------------------------------------------------------------------------
+// PRELOAD SCENE
+// ---------------------------------------------------------------------------
+class PreloadScene extends Phaser.Scene {
+  constructor() { super('PreloadScene'); }
+  create() {
+    generateTextures(this);
+    this.scene.start('MenuScene');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MENU SCENE
+// ---------------------------------------------------------------------------
+class MenuScene extends Phaser.Scene {
+  constructor() { super('MenuScene'); }
+
+  create() {
+    GameData.state = 'menu';
+    const { width: w, height: h } = this.scale;
+
+    this.add.tileSprite(0, 0, w, h, 'gridTile').setOrigin(0, 0).setAlpha(0.6);
+
+    this.add.text(w / 2, h * 0.24, 'VECTOR SIEGE', {
+      fontFamily: 'Orbitron', fontSize: '64px', color: HEX(PALETTE.player), fontStyle: '800'
+    }).setOrigin(0.5).setShadow(0, 0, HEX(PALETTE.player), 16, true, true);
+
+    this.add.text(w / 2, h * 0.33, 'A NEON ARENA SURVIVAL SHOOTER', {
+      fontFamily: 'Share Tech Mono', fontSize: '16px', color: HEX(PALETTE.ui), letterSpacing: 4
+    }).setOrigin(0.5);
+
+    const lines = [
+      'MOVE  —  W A S D  /  ARROW KEYS',
+      'AIM & FIRE  —  MOUSE  (hold to fire)',
+      'OVERDRIVE BURST  —  SPACE  (when charged)',
+      'PAUSE  —  P        MUTE  —  M'
+    ];
+    lines.forEach((line, i) => {
+      this.add.text(w / 2, h * 0.48 + i * 26, line, {
+        fontFamily: 'Share Tech Mono', fontSize: '15px', color: HEX(PALETTE.ui)
+      }).setOrigin(0.5).setAlpha(0.85);
+    });
+
+    const startBtn = this.add.text(w / 2, h * 0.72, '[ START MISSION ]', {
+      fontFamily: 'Orbitron', fontSize: '26px', color: HEX(PALETTE.shard), fontStyle: '600'
+    }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+
+    this.tweens.add({ targets: startBtn, alpha: 0.5, duration: 700, yoyo: true, repeat: -1 });
+
+    startBtn.on('pointerover', () => startBtn.setScale(1.08));
+    startBtn.on('pointerout', () => startBtn.setScale(1));
+    startBtn.on('pointerdown', () => {
+      Audio.resume();
+      Audio.uiClick();
+      GameData.reset();
+      this.scene.start('GameScene');
+    });
+
+    this.input.keyboard.once('keydown-SPACE', () => {
+      Audio.resume();
+      Audio.uiClick();
+      GameData.reset();
+      this.scene.start('GameScene');
+    });
+
+    this.add.text(w / 2, h * 0.92, 'Survive 3 assault waves, then destroy the SENTINEL CORE.', {
+      fontFamily: 'Share Tech Mono', fontSize: '13px', color: HEX(PALETTE.chaser)
+    }).setOrigin(0.5);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PLAYER — encapsulates movement, aiming, firing, heat, health & overdrive.
+// ---------------------------------------------------------------------------
+class Player {
+  constructor(scene, x, y) {
+    this.scene = scene;
+    this.sprite = scene.physics.add.sprite(x, y, 'player');
+    this.sprite.setDamping(true);
+    this.sprite.setDrag(0.86);
+    this.sprite.setMaxVelocity(340);
+    this.sprite.setCollideWorldBounds(true);
+    this.baseSpeed = 620;
+    this.invulnUntil = 0;
+    this.lastFired = 0;
+    this.fireRate = 140; // ms between shots at normal state
+  }
+
+  get x() { return this.sprite.x; }
+  get y() { return this.sprite.y; }
+
+  update(time, cursors, keys, pointer) {
+    // --- Movement: normalized 8-directional acceleration.
+    let dx = 0, dy = 0;
+    if (cursors.left.isDown || keys.A.isDown) dx -= 1;
+    if (cursors.right.isDown || keys.D.isDown) dx += 1;
+    if (cursors.up.isDown || keys.W.isDown) dy -= 1;
+    if (cursors.down.isDown || keys.S.isDown) dy += 1;
+    const len = Math.hypot(dx, dy) || 1;
+    const speedMult = GameData.overdriveActive ? 1.35 : 1;
+    this.sprite.setAcceleration((dx / len) * this.baseSpeed * speedMult, (dy / len) * this.baseSpeed * speedMult);
+
+    // --- Aim toward the mouse pointer (rotate sprite to face cursor).
+    const worldPoint = pointer.positionToCamera(this.scene.cameras.main);
+    const angle = Phaser.Math.Angle.Between(this.x, this.y, worldPoint.x, worldPoint.y);
+    this.sprite.rotation = angle + Math.PI / 2;
+
+    // --- Weapon heat cooldown: heat drains steadily when not firing.
+    if (!GameData.overheated) {
+      GameData.heat = Math.max(0, GameData.heat - 0.6);
+    } else {
+      GameData.heat = Math.max(0, GameData.heat - 1.1);
+      if (GameData.heat <= 0) GameData.overheated = false;
+    }
+
+    // --- Overdrive timer countdown.
+    if (GameData.overdriveActive) {
+      GameData.overdriveTimer -= this.scene.game.loop.delta;
+      if (GameData.overdriveTimer <= 0) {
+        GameData.overdriveActive = false;
+      }
+    }
+
+    // --- Firing: mouse held down, gated by fire-rate and heat.
+    if (pointer.isDown && time > this.lastFired && !GameData.overheated) {
+      this.fire(time, angle);
+    }
+
+    // --- Overdrive activation via SPACE when meter is full.
+    if (keys.SPACE.isDown && GameData.overdrive >= 100 && !GameData.overdriveActive) {
+      this.activateOverdrive();
+    }
+  }
+
+  fire(time, angle) {
+    const rate = GameData.overdriveActive ? this.fireRate * 0.45 : this.fireRate;
+    this.lastFired = time + rate;
+
+    const spreadAngles = GameData.overdriveActive ? [-0.18, 0, 0.18] : [0];
+    spreadAngles.forEach((offset) => {
+      const bullet = this.scene.playerBullets.get(this.x, this.y, 'bulletPlayer');
+      if (!bullet) return;
+      bullet.setActive(true).setVisible(true);
+      bullet.rotation = angle + offset + Math.PI / 2;
+      const speed = 780;
+      bullet.body.reset(this.x, this.y);
+      bullet.setVelocity(Math.cos(angle + offset) * speed, Math.sin(angle + offset) * speed);
+      bullet.body.setAllowGravity(false);
+      this.scene.time.delayedCall(1000, () => { if (bullet.active) bullet.setActive(false).setVisible(false).body.stop(); });
+    });
+
+    Audio.shoot();
+    GameData.heat = Math.min(100, GameData.heat + (GameData.overdriveActive ? 4 : 8));
+    if (GameData.heat >= 100) {
+      GameData.overheated = true;
+      Audio.overheat();
+    }
+  }
+
+  activateOverdrive() {
+    GameData.overdrive = 0;
+    GameData.overdriveActive = true;
+    GameData.overdriveTimer = 4500;
+    GameData.overheated = false;
+    GameData.heat = 0;
+    Audio.overdrive();
+    this.scene.cameras.main.flash(200, 0, 200, 255, false);
+  }
+
+  takeDamage(amount, time) {
+    if (time < this.invulnUntil) return false;
+    GameData.health -= amount;
+    this.invulnUntil = time + 900;
+    Audio.playerHit();
+    this.scene.cameras.main.shake(180, 0.01);
+    this.scene.cameras.main.flash(120, 255, 40, 70, false);
+    this.sprite.setTintFill(0xffffff);
+    this.scene.time.delayedCall(120, () => this.sprite.clearTint());
+    return true;
+  }
+
+  isInvuln(time) { return time < this.invulnUntil; }
+}
+
+// ---------------------------------------------------------------------------
+// ENEMY FACTORY — creates enemy sprites with per-type stats attached via
+// setData(), keeping stat/behavior data separate from the Phaser sprite.
+// ---------------------------------------------------------------------------
+const ENEMY_TYPES = {
+  grunt:   { texture: 'grunt',   hp: 2, speed: 95,  score: 100, damage: 1, radius: 12 },
+  shooter: { texture: 'shooter', hp: 3, speed: 60,  score: 150, damage: 1, radius: 14, ranged: true },
+  chaser:  { texture: 'chaser',  hp: 1, speed: 205, score: 120, damage: 1, radius: 10 }
+};
+
+function spawnEnemy(scene, type, x, y, waveMultiplier) {
+  const def = ENEMY_TYPES[type];
+  const enemy = scene.enemies.create(x, y, def.texture);
+  enemy.setData('type', type);
+  enemy.setData('hp', def.hp + Math.floor(waveMultiplier * 0.6));
+  enemy.setData('maxHp', def.hp + Math.floor(waveMultiplier * 0.6));
+  enemy.setData('speed', def.speed + waveMultiplier * 8);
+  enemy.setData('score', def.score);
+  enemy.setData('damage', def.damage);
+  enemy.setData('ranged', !!def.ranged);
+  enemy.setData('lastShot', 0);
+  enemy.setCircle(def.radius);
+  // Intentionally NOT colliding with world bounds: enemies spawn just
+  // outside the visible arena and glide in, which reads better than
+  // snapping instantly to the boundary on the frame they're created.
+  return enemy;
+}
+
+// Simple per-frame AI: grunts & chasers pursue the player directly (chasers
+// faster/weaker), shooters keep a preferred distance and fire projectiles.
+function updateEnemyAI(scene, enemy, player, time) {
+  const type = enemy.getData('type');
+  const speed = enemy.getData('speed');
+  const angle = Phaser.Math.Angle.Between(enemy.x, enemy.y, player.x, player.y);
+  const dist = Phaser.Math.Distance.Between(enemy.x, enemy.y, player.x, player.y);
+
+  if (type === 'shooter') {
+    const preferred = 260;
+    if (dist > preferred + 20) {
+      scene.physics.velocityFromRotation(angle, speed, enemy.body.velocity);
+    } else if (dist < preferred - 20) {
+      scene.physics.velocityFromRotation(angle + Math.PI, speed, enemy.body.velocity);
+    } else {
+      enemy.setVelocity(enemy.body.velocity.x * 0.9, enemy.body.velocity.y * 0.9);
+    }
+    const lastShot = enemy.getData('lastShot');
+    const fireInterval = Math.max(650, 1500 - GameData.wave * 120);
+    if (time > lastShot + fireInterval) {
+      enemy.setData('lastShot', time);
+      fireEnemyBullet(scene, enemy, angle);
+    }
+  } else {
+    scene.physics.velocityFromRotation(angle, speed, enemy.body.velocity);
+  }
+  enemy.rotation = angle + Math.PI / 2;
+}
+
+function fireEnemyBullet(scene, enemy, angle) {
+  const bullet = scene.enemyBullets.get(enemy.x, enemy.y, 'bulletEnemy');
+  if (!bullet) return;
+  bullet.setActive(true).setVisible(true);
+  bullet.body.reset(enemy.x, enemy.y);
+  bullet.body.setAllowGravity(false);
+  const speed = 260;
+  bullet.setVelocity(Math.cos(angle) * speed, Math.sin(angle) * speed);
+  bullet.rotation = angle + Math.PI / 2;
+  Audio.enemyShoot();
+  scene.time.delayedCall(2500, () => { if (bullet.active) bullet.setActive(false).setVisible(false).body.stop(); });
+}
+
+// ---------------------------------------------------------------------------
+// SHARD FACTORY — pickups dropped by defeated enemies. Drift toward the
+// player once within magnet range (handled in GameScene.update).
+// ---------------------------------------------------------------------------
+function spawnShard(scene, x, y) {
+  const shard = scene.shards.create(x, y, 'shard');
+  shard.setCircle(7);
+  scene.tweens.add({ targets: shard, angle: 360, duration: 1400, repeat: -1 });
+  scene.tweens.add({ targets: shard, y: y - 6, duration: 500, yoyo: true, repeat: -1, ease: 'Sine.easeInOut' });
+  return shard;
+}
+
+// ---------------------------------------------------------------------------
+// WAVE MANAGER — declarative wave definitions + spawn scheduling.
+// Waves 1-3 escalate enemy count/mix; wave 4 is the boss encounter.
+// ---------------------------------------------------------------------------
+class WaveManager {
+  constructor(scene) {
+    this.scene = scene;
+    this.waveDefs = [
+      { grunt: 4, shooter: 1, chaser: 2 },
+      { grunt: 6, shooter: 2, chaser: 3 },
+      { grunt: 8, shooter: 3, chaser: 5 }
+    ];
+    this.spawnQueue = [];
+    this.spawnTimer = 0;
+    this.active = false;
+  }
+
+  startWave(waveNumber) {
+    this.active = true;
+    if (waveNumber <= 3) {
+      const def = this.waveDefs[waveNumber - 1];
+      this.spawnQueue = [];
+      Object.entries(def).forEach(([type, count]) => {
+        for (let i = 0; i < count; i++) this.spawnQueue.push(type);
+      });
+      Phaser.Utils.Array.Shuffle(this.spawnQueue);
+      this.spawnTimer = 0;
+    } else {
+      this.scene.spawnBoss();
+    }
+  }
+
+  update(time, delta) {
+    if (!this.active || GameData.wave > 3) return;
+    this.spawnTimer -= delta;
+    if (this.spawnTimer <= 0 && this.spawnQueue.length > 0) {
+      const type = this.spawnQueue.shift();
+      const spawnPoint = this.randomEdgePoint();
+      spawnEnemy(this.scene, type, spawnPoint.x, spawnPoint.y, GameData.wave);
+      this.spawnTimer = Math.max(280, 900 - GameData.wave * 100);
+    }
+  }
+
+  randomEdgePoint() {
+    const { width: w, height: h } = this.scene.scale;
+    const side = Phaser.Math.Between(0, 3);
+    if (side === 0) return { x: Phaser.Math.Between(0, w), y: -20 };
+    if (side === 1) return { x: Phaser.Math.Between(0, w), y: h + 20 };
+    if (side === 2) return { x: -20, y: Phaser.Math.Between(0, h) };
+    return { x: w + 20, y: Phaser.Math.Between(0, h) };
+  }
+
+  get queueEmpty() { return this.spawnQueue.length === 0; }
+}
+
+// ---------------------------------------------------------------------------
+// GAME SCENE
+// ---------------------------------------------------------------------------
+class GameScene extends Phaser.Scene {
+  constructor() { super('GameScene'); }
+
+  create() {
+    GameData.state = 'playing';
+    const { width: w, height: h } = this.scale;
+
+    this.add.tileSprite(0, 0, w, h, 'gridTile').setOrigin(0, 0).setName('bgGrid');
+
+    // --- Groups ---------------------------------------------------------
+    this.playerBullets = this.physics.add.group({ maxSize: 60 });
+    this.enemyBullets = this.physics.add.group({ maxSize: 60 });
+    this.enemies = this.physics.add.group();
+    this.shards = this.physics.add.group();
+
+    // --- Player -----------------------------------------------------------
+    this.player = new Player(this, w / 2, h / 2);
+
+    // --- Input --------------------------------------------------------
+    this.cursors = this.input.keyboard.createCursorKeys();
+    this.keys = this.input.keyboard.addKeys('W,A,S,D,SPACE,P,M');
+
+    this.keys.P.on('down', () => this.togglePause());
+    this.keys.M.on('down', () => { GameData.muted = !GameData.muted; this.updateMuteLabel(); });
+
+    // --- Wave management -------------------------------------------------
+    this.waveManager = new WaveManager(this);
+    this.boss = null;
+    this.waveTransitionActive = false;
+
+    this.setupCollisions();
+    this.buildHUD();
+    this.buildPauseOverlay();
+
+    Audio.resume();
+    Audio.startMusic();
+
+    this.showWaveBanner(`WAVE ${GameData.wave}`, () => this.waveManager.startWave(GameData.wave));
+  }
+
+  // -----------------------------------------------------------------------
+  buildHUD() {
+    const pad = 18;
+    this.hearts = [];
+    for (let i = 0; i < GameData.maxHealth; i++) {
+      const heart = this.add.image(pad + i * 28, pad, 'heart').setScrollFactor(0).setScale(0.9);
+      this.hearts.push(heart);
+    }
+
+    this.scoreText = this.add.text(this.scale.width - pad, pad, 'SCORE 0', {
+      fontFamily: 'Share Tech Mono', fontSize: '20px', color: HEX(PALETTE.ui)
+    }).setOrigin(1, 0).setScrollFactor(0);
+
+    this.waveText = this.add.text(this.scale.width / 2, pad, 'WAVE 1 / 4', {
+      fontFamily: 'Orbitron', fontSize: '18px', color: HEX(PALETTE.shooter)
+    }).setOrigin(0.5, 0).setScrollFactor(0);
+
+    // Overdrive meter
+    this.add.text(pad, pad + 36, 'OVERDRIVE', { fontFamily: 'Share Tech Mono', fontSize: '11px', color: HEX(PALETTE.shard) }).setScrollFactor(0);
+    this.overdriveBarBg = this.add.rectangle(pad, pad + 54, 140, 10, 0x0a1a12).setOrigin(0, 0).setScrollFactor(0);
+    this.overdriveBar = this.add.rectangle(pad, pad + 54, 0, 10, PALETTE.shard).setOrigin(0, 0).setScrollFactor(0);
+
+    // Heat meter
+    this.add.text(pad, pad + 70, 'WEAPON HEAT', { fontFamily: 'Share Tech Mono', fontSize: '11px', color: HEX(PALETTE.shooter) }).setScrollFactor(0);
+    this.heatBarBg = this.add.rectangle(pad, pad + 88, 140, 10, 0x1a1206).setOrigin(0, 0).setScrollFactor(0);
+    this.heatBar = this.add.rectangle(pad, pad + 88, 0, 10, PALETTE.shooter).setOrigin(0, 0).setScrollFactor(0);
+
+    this.muteLabel = this.add.text(this.scale.width - pad, this.scale.height - pad, '', {
+      fontFamily: 'Share Tech Mono', fontSize: '13px', color: HEX(PALETTE.ui)
+    }).setOrigin(1, 1).setScrollFactor(0).setAlpha(0.7);
+    this.updateMuteLabel();
+
+    // Boss health bar (hidden until boss spawns)
+    this.bossBarBg = this.add.rectangle(this.scale.width / 2, 56, 400, 14, 0x1a0a10).setScrollFactor(0).setVisible(false);
+    this.bossBar = this.add.rectangle(this.scale.width / 2 - 200, 56, 400, 14, PALETTE.boss).setOrigin(0, 0.5).setScrollFactor(0).setVisible(false);
+    this.bossLabel = this.add.text(this.scale.width / 2, 34, 'SENTINEL CORE', {
+      fontFamily: 'Orbitron', fontSize: '15px', color: HEX(PALETTE.boss)
+    }).setOrigin(0.5).setScrollFactor(0).setVisible(false);
+  }
+
+  updateMuteLabel() {
+    this.muteLabel.setText(GameData.muted ? '[M] SOUND: OFF' : '[M] SOUND: ON');
+  }
+
+  buildPauseOverlay() {
+    const { width: w, height: h } = this.scale;
+    this.pauseOverlay = this.add.container(0, 0).setScrollFactor(0).setDepth(100).setVisible(false);
+    const bg = this.add.rectangle(0, 0, w, h, 0x05060f, 0.75).setOrigin(0, 0);
+    const label = this.add.text(w / 2, h / 2 - 20, 'PAUSED', {
+      fontFamily: 'Orbitron', fontSize: '42px', color: HEX(PALETTE.player)
+    }).setOrigin(0.5);
+    const hint = this.add.text(w / 2, h / 2 + 30, 'PRESS P TO RESUME', {
+      fontFamily: 'Share Tech Mono', fontSize: '16px', color: HEX(PALETTE.ui)
+    }).setOrigin(0.5);
+    this.pauseOverlay.add([bg, label, hint]);
+  }
+
+  togglePause() {
+    if (GameData.state === 'playing') {
+      GameData.state = 'paused';
+      this.physics.pause();
+      this.pauseOverlay.setVisible(true);
+      Audio.uiClick();
+    } else if (GameData.state === 'paused') {
+      GameData.state = 'playing';
+      this.physics.resume();
+      this.pauseOverlay.setVisible(false);
+      Audio.uiClick();
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  showWaveBanner(text, onComplete) {
+    const { width: w, height: h } = this.scale;
+    const banner = this.add.text(w / 2, h / 2, text, {
+      fontFamily: 'Orbitron', fontSize: '48px', color: HEX(PALETTE.player), fontStyle: '800'
+    }).setOrigin(0.5).setAlpha(0).setScrollFactor(0).setDepth(90);
+    this.tweens.add({
+      targets: banner, alpha: 1, duration: 350, yoyo: true, hold: 700,
+      onComplete: () => { banner.destroy(); if (onComplete) onComplete(); }
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  spawnBoss() {
+    const { width: w } = this.scale;
+    this.boss = this.enemies.create(w / 2, -80, 'boss');
+    this.boss.setData('type', 'boss');
+    this.boss.setData('hp', 60);
+    this.boss.setData('maxHp', 60);
+    this.boss.setData('phase', 'entry');
+    this.boss.setData('lastAttack', 0);
+    this.boss.setCircle(40);
+    this.boss.setCollideWorldBounds(true);
+    this.boss.setBounce(1);
+    this.boss.body.setImmovable(true);
+
+    this.bossBarBg.setVisible(true);
+    this.bossBar.setVisible(true);
+    this.bossLabel.setVisible(true);
+
+    this.tweens.add({
+      targets: this.boss, y: 130, duration: 1600, ease: 'Sine.easeOut',
+      onComplete: () => { this.boss.setData('phase', 'attack'); this.boss.body.setImmovable(false); }
+    });
+  }
+
+  updateBoss(time) {
+    if (!this.boss || !this.boss.active) return;
+    const maxHp = this.boss.getData('maxHp');
+    const hp = this.boss.getData('hp');
+    this.bossBar.width = 400 * Phaser.Math.Clamp(hp / maxHp, 0, 1);
+
+    if (this.boss.getData('phase') !== 'attack') return;
+
+    // Slow lateral drift.
+    if (!this.boss.getData('driftDir') || Phaser.Math.Between(0, 400) === 0) {
+      this.boss.setData('driftDir', Phaser.Math.Between(0, 1) ? 1 : -1);
+    }
+    this.boss.setVelocityX(this.boss.getData('driftDir') * 60);
+    this.boss.setVelocityY(Math.sin(time / 900) * 40);
+
+    const lastAttack = this.boss.getData('lastAttack');
+    const interval = Math.max(1400, 2400 - (maxHp - hp) * 15); // attacks faster as it takes damage
+    if (time > lastAttack + interval) {
+      this.boss.setData('lastAttack', time);
+      this.bossRadialBurst();
+    }
+  }
+
+  bossRadialBurst() {
+    const bulletCount = 10;
+    for (let i = 0; i < bulletCount; i++) {
+      const angle = (Math.PI * 2 * i) / bulletCount;
+      fireEnemyBullet(this, this.boss, angle);
+    }
+    this.cameras.main.flash(100, 255, 40, 60, false);
+  }
+
+  // -----------------------------------------------------------------------
+  setupCollisions() {
+    // Player bullets vs enemies (includes boss, since boss lives in `enemies`).
+    this.physics.add.overlap(this.playerBullets, this.enemies, (bulletObj, enemyObj) => {
+      if (!bulletObj.active || !enemyObj.active) return;
+      bulletObj.setActive(false).setVisible(false).body.stop();
+      this.damageEnemy(enemyObj, 1);
+    });
+
+    // Enemy bullets vs player.
+    // NOTE: Arcade Physics passes callback args in the same order the two
+    // groups/objects were passed to add.overlap() — (enemyBullets member, player.sprite).
+    this.physics.add.overlap(this.enemyBullets, this.player.sprite, (bulletObj, playerSprite) => {
+      if (!bulletObj.active) return;
+      bulletObj.setActive(false).setVisible(false).body.stop();
+      this.hurtPlayer(1);
+    });
+
+    // Enemies vs player (contact damage + knockback).
+    this.physics.add.overlap(this.enemies, this.player.sprite, (enemyObj, playerSprite) => {
+      if (!enemyObj.active) return;
+      const dmg = enemyObj.getData('damage') || 1;
+      this.hurtPlayer(dmg);
+      // Knockback: push enemy and player apart slightly for readability.
+      const angle = Phaser.Math.Angle.Between(enemyObj.x, enemyObj.y, this.player.x, this.player.y);
+      this.player.sprite.setVelocity(Math.cos(angle) * 200, Math.sin(angle) * 200);
+    });
+
+    // Player vs shards (collect resource).
+    this.physics.add.overlap(this.shards, this.player.sprite, (shardObj, playerSprite) => {
+      if (!shardObj.active) return;
+      shardObj.destroy();
+      GameData.shardsCollected++;
+      GameData.score += 25;
+      GameData.overdrive = Math.min(100, GameData.overdrive + 12);
+      Audio.pickup();
+    });
+  }
+
+  hurtPlayer(amount) {
+    const time = this.time.now;
+    const applied = this.player.takeDamage(amount, time);
+    if (applied) this.refreshHearts();
+    if (GameData.health <= 0) this.triggerGameOver();
+  }
+
+  damageEnemy(enemyObj, amount) {
+    const hp = enemyObj.getData('hp') - amount;
+    enemyObj.setData('hp', hp);
+    enemyObj.setTintFill(0xffffff);
+    this.time.delayedCall(60, () => { if (enemyObj.active) enemyObj.clearTint(); });
+    Audio.hit();
+
+    if (hp <= 0) {
+      this.killEnemy(enemyObj);
+    }
+  }
+
+  killEnemy(enemyObj) {
+    const isBoss = enemyObj.getData('type') === 'boss';
+    const score = isBoss ? 5000 : (enemyObj.getData('score') || 100);
+    GameData.score += score;
+    GameData.enemiesKilled++;
+    Audio.explosion();
+    this.spawnExplosion(enemyObj.x, enemyObj.y, isBoss ? PALETTE.boss : PALETTE.grunt, isBoss ? 2.2 : 1);
+
+    if (!isBoss) spawnShard(this, enemyObj.x, enemyObj.y);
+    enemyObj.destroy();
+
+    if (isBoss) {
+      this.bossBar.setVisible(false);
+      this.bossBarBg.setVisible(false);
+      this.bossLabel.setVisible(false);
+      this.triggerVictory();
+    }
+  }
+
+  spawnExplosion(x, y, color, scale = 1) {
+    const particles = this.add.particles(x, y, 'particle', {
+      speed: { min: 60, max: 220 * scale },
+      lifespan: 420,
+      scale: { start: 1.2 * scale, end: 0 },
+      tint: color,
+      quantity: Math.floor(14 * scale),
+      blendMode: 'ADD'
+    });
+    particles.explode(Math.floor(14 * scale));
+    this.time.delayedCall(500, () => particles.destroy());
+  }
+
+  refreshHearts() {
+    this.hearts.forEach((heart, i) => heart.setAlpha(i < GameData.health ? 1 : 0.15));
+  }
+
+  // -----------------------------------------------------------------------
+  triggerGameOver() {
+    if (GameData.state === 'gameover') return;
+    GameData.state = 'gameover';
+    Audio.defeat();
+    Audio.stopMusic();
+    this.physics.pause();
+    this.time.delayedCall(900, () => this.scene.start('GameOverScene'));
+  }
+
+  triggerVictory() {
+    if (GameData.state === 'victory') return;
+    GameData.state = 'victory';
+    Audio.victory();
+    Audio.stopMusic();
+    this.physics.pause();
+    this.time.delayedCall(1200, () => this.scene.start('VictoryScene'));
+  }
+
+  // -----------------------------------------------------------------------
+  checkWaveProgress() {
+    if (GameData.wave > 3 || this.waveTransitionActive) return;
+    if (this.waveManager.queueEmpty && this.enemies.countActive(true) === 0) {
+      this.waveTransitionActive = true;
+      Audio.waveClear();
+      GameData.score += 500;
+      GameData.wave++;
+      this.waveText.setText(`WAVE ${Math.min(GameData.wave, 4)} / 4`);
+      const label = GameData.wave > 3 ? 'FINAL WAVE\nSENTINEL CORE INBOUND' : `WAVE ${GameData.wave}`;
+      this.time.delayedCall(1200, () => {
+        this.showWaveBanner(label, () => {
+          this.waveTransitionActive = false;
+          this.waveManager.startWave(GameData.wave);
+        });
+      });
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  update(time, delta) {
+    if (GameData.state !== 'playing') return;
+
+    this.player.update(time, this.cursors, this.keys, this.input.activePointer);
+
+    this.enemies.getChildren().forEach((enemy) => {
+      if (!enemy.active) return;
+      if (enemy.getData('type') === 'boss') {
+        this.updateBoss(time);
+      } else {
+        updateEnemyAI(this, enemy, this.player, time);
+      }
+    });
+
+    // Magnetize nearby shards toward the player.
+    this.shards.getChildren().forEach((shard) => {
+      if (!shard.active) return;
+      const dist = Phaser.Math.Distance.Between(shard.x, shard.y, this.player.x, this.player.y);
+      if (dist < 140) {
+        const angle = Phaser.Math.Angle.Between(shard.x, shard.y, this.player.x, this.player.y);
+        shard.x += Math.cos(angle) * 6;
+        shard.y += Math.sin(angle) * 6;
+      }
+    });
+
+    this.waveManager.update(time, delta);
+    this.checkWaveProgress();
+
+    // --- HUD refresh ------------------------------------------------------
+    this.scoreText.setText(`SCORE ${GameData.score}`);
+    this.overdriveBar.width = 140 * (GameData.overdrive / 100);
+    this.overdriveBar.fillColor = GameData.overdrive >= 100 ? PALETTE.player : PALETTE.shard;
+    this.heatBar.width = 140 * (GameData.heat / 100);
+    this.heatBar.fillColor = GameData.overheated ? PALETTE.danger : PALETTE.shooter;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GAME OVER SCENE
+// ---------------------------------------------------------------------------
+class GameOverScene extends Phaser.Scene {
+  constructor() { super('GameOverScene'); }
+  create() {
+    const { width: w, height: h } = this.scale;
+    this.add.tileSprite(0, 0, w, h, 'gridTile').setOrigin(0, 0).setAlpha(0.5);
+
+    this.add.text(w / 2, h * 0.32, 'SHIP DESTROYED', {
+      fontFamily: 'Orbitron', fontSize: '52px', color: HEX(PALETTE.danger), fontStyle: '800'
+    }).setOrigin(0.5).setShadow(0, 0, HEX(PALETTE.danger), 18, true, true);
+
+    this.add.text(w / 2, h * 0.45, `WAVE REACHED: ${GameData.wave} / 4`, {
+      fontFamily: 'Share Tech Mono', fontSize: '20px', color: HEX(PALETTE.ui)
+    }).setOrigin(0.5);
+    this.add.text(w / 2, h * 0.51, `FINAL SCORE: ${GameData.score}`, {
+      fontFamily: 'Share Tech Mono', fontSize: '24px', color: HEX(PALETTE.shard)
+    }).setOrigin(0.5);
+    this.add.text(w / 2, h * 0.57, `ENEMIES DESTROYED: ${GameData.enemiesKilled}   SHARDS: ${GameData.shardsCollected}`, {
+      fontFamily: 'Share Tech Mono', fontSize: '14px', color: HEX(PALETTE.ui)
+    }).setOrigin(0.5).setAlpha(0.8);
+
+    const retryBtn = this.add.text(w / 2, h * 0.72, '[ RETRY ]', {
+      fontFamily: 'Orbitron', fontSize: '28px', color: HEX(PALETTE.player)
+    }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+    this.tweens.add({ targets: retryBtn, alpha: 0.5, duration: 700, yoyo: true, repeat: -1 });
+    retryBtn.on('pointerdown', () => { Audio.uiClick(); GameData.reset(); this.scene.start('GameScene'); });
+    this.input.keyboard.once('keydown-SPACE', () => { Audio.uiClick(); GameData.reset(); this.scene.start('GameScene'); });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// VICTORY SCENE
+// ---------------------------------------------------------------------------
+class VictoryScene extends Phaser.Scene {
+  constructor() { super('VictoryScene'); }
+  create() {
+    const { width: w, height: h } = this.scale;
+    this.add.tileSprite(0, 0, w, h, 'gridTile').setOrigin(0, 0).setAlpha(0.5);
+
+    const particles = this.add.particles(w / 2, h * 0.3, 'particle', {
+      speed: { min: 40, max: 160 }, lifespan: 1200, scale: { start: 1.4, end: 0 },
+      tint: [PALETTE.player, PALETTE.shard, PALETTE.shooter], quantity: 2, frequency: 60, blendMode: 'ADD'
+    });
+    this.time.delayedCall(3000, () => particles.destroy());
+
+    this.add.text(w / 2, h * 0.3, 'SENTINEL CORE DESTROYED', {
+      fontFamily: 'Orbitron', fontSize: '40px', color: HEX(PALETTE.player), fontStyle: '800'
+    }).setOrigin(0.5).setShadow(0, 0, HEX(PALETTE.player), 20, true, true);
+
+    this.add.text(w / 2, h * 0.42, 'ARENA SECURED', {
+      fontFamily: 'Share Tech Mono', fontSize: '18px', color: HEX(PALETTE.ui)
+    }).setOrigin(0.5).setAlpha(0.85);
+
+    this.add.text(w / 2, h * 0.52, `FINAL SCORE: ${GameData.score}`, {
+      fontFamily: 'Share Tech Mono', fontSize: '26px', color: HEX(PALETTE.shard)
+    }).setOrigin(0.5);
+    this.add.text(w / 2, h * 0.58, `ENEMIES DESTROYED: ${GameData.enemiesKilled}   SHARDS: ${GameData.shardsCollected}`, {
+      fontFamily: 'Share Tech Mono', fontSize: '14px', color: HEX(PALETTE.ui)
+    }).setOrigin(0.5).setAlpha(0.8);
+
+    const retryBtn = this.add.text(w / 2, h * 0.74, '[ PLAY AGAIN ]', {
+      fontFamily: 'Orbitron', fontSize: '26px', color: HEX(PALETTE.shooter)
+    }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+    this.tweens.add({ targets: retryBtn, alpha: 0.5, duration: 700, yoyo: true, repeat: -1 });
+    retryBtn.on('pointerdown', () => { Audio.uiClick(); GameData.reset(); this.scene.start('GameScene'); });
+    this.input.keyboard.once('keydown-SPACE', () => { Audio.uiClick(); GameData.reset(); this.scene.start('GameScene'); });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GAME CONFIG & BOOT
+// ---------------------------------------------------------------------------
+const config = {
+  type: Phaser.AUTO,
+  parent: 'game-root',
+  width: 960,
+  height: 640,
+  backgroundColor: HEX(PALETTE.bg),
+  physics: {
+    default: 'arcade',
+    arcade: { debug: false }
+  },
+  scene: [PreloadScene, MenuScene, GameScene, GameOverScene, VictoryScene]
+};
+
+new Phaser.Game(config);
+</script>
+</body>
+</html>
